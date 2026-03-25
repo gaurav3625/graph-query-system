@@ -1,0 +1,4 @@
+backend/node_modules
+backend/business.db
+backend/.env
+frontend/node_modules
