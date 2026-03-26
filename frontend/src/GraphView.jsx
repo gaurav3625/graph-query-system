@@ -11,6 +11,9 @@ const TYPE_COLORS = {
   Product: "#14b8a6",
 };
 
+const NODE_TYPES = {};
+const EDGE_TYPES = {};
+
 function GraphView() {
   const [nodes, setNodes] = useState([]);
   const [edges, setEdges] = useState([]);
@@ -116,6 +119,8 @@ function GraphView() {
       <ReactFlow
         nodes={nodes}
         edges={edges}
+        nodeTypes={NODE_TYPES}
+        edgeTypes={EDGE_TYPES}
         onNodeClick={onNodeClick}
         onPaneClick={onPaneClick}
         fitView

@@ -5,8 +5,15 @@ const Groq = require("groq-sdk");
 const { db, getSchema } = require("../db");
 
 const router = express.Router();
-const client = new Groq({ apiKey: process.env.GROQ_API_KEY });
+
 const MODEL = "llama-3.3-70b-versatile";
+const GROQ_API_KEY = process.env.GROQ_API_KEY;
+const client = new Groq({ apiKey: GROQ_API_KEY });
+
+function cleanJsonText(text) {
+  if (!text) return "";
+  return text.replace(/```/g, "").trim();
+}
 
 function cleanSql(raw) {
   if (!raw) return "";
@@ -25,167 +32,125 @@ router.post("/", async (req, res) => {
       return res.status(400).json({ answer: "Please provide a valid message." });
     }
 
-    if (!process.env.GROQ_API_KEY) {
+    if (!GROQ_API_KEY) {
       throw new Error("Missing GROQ_API_KEY");
     }
 
     const schema = getSchema();
-    if (!Array.isArray(schema)) {
-      throw new Error("Invalid schema");
-    }
 
-    const relevanceResponse = await client.chat.completions.create({
+    const systemPrompt =
+      "You are an AI assistant for a SAP Order-to-Cash (O2C) business database. \n\nSTRICT RULES:\n- Only answer questions about this business data. If the question is unrelated to sales orders, deliveries, billing, payments, customers or products, respond with JSON: {\"type\": \"off_topic\"}\n- Always respond with valid JSON in one of these formats:\n  {\"type\": \"sql\", \"query\": \"SELECT ...\"}\n  {\"type\": \"off_topic\"}\n\nDATABASE SCHEMA AND RELATIONSHIPS:\nTables:\n- sales_order_headers: salesOrder, soldToParty, totalNetAmount, overallDeliveryStatus, overallOrdReltdBillgStatus, creationDate, transactionCurrency\n- sales_order_items: salesOrder, salesOrderItem, material, netAmount, requestedQuantity\n- outbound_delivery_headers: deliveryDocument, shippingPoint, overallGoodsMovementStatus, creationDate\n- outbound_delivery_items: deliveryDocument, referenceSdDocument, plant, actualDeliveryQuantity\n- billing_document_headers: billingDocument, soldToParty, totalNetAmount, billingDocumentDate, accountingDocument, billingDocumentIsCancelled\n- billing_document_items: billingDocument, billingDocumentItem, referenceSdDocument, material, netAmount\n- payments_accounts_receivable: accountingDocument, customer, invoiceReference, amountInTransactionCurrency, postingDate\n- business_partners: businessPartner, customer, businessPartnerFullName, businessPartnerName\n- products: product, productType, division\n- product_descriptions: product, language, productDescription\n- journal_entry_items_accounts_receivable: accountingDocument, companyCode, customer, amountInTransactionCurrency\n\nCRITICAL JOIN PATHS (always use these exact joins):\n- Sales Order → Delivery: outbound_delivery_items.referenceSdDocument = sales_order_headers.salesOrder\n- Delivery → Billing: billing_document_items.referenceSdDocument = outbound_delivery_headers.deliveryDocument  \n- Billing → Payment: payments_accounts_receivable.invoiceReference = billing_document_headers.billingDocument\n- Billing → Journal: billing_document_headers.accountingDocument = journal_entry_items_accounts_receivable.accountingDocument\n- Customer → Sales Order: sales_order_headers.soldToParty = business_partners.customer\n- Product → Billing: billing_document_items.material = products.product\n- Product name: JOIN product_descriptions pd ON pd.product = products.product AND pd.language = 'EN'\n\nEXAMPLE QUERIES:\nQ: Which products have most billing documents?\nA: {\"type\":\"sql\",\"query\":\"SELECT pd.productDescription, COUNT(DISTINCT bdi.billingDocument) as billingCount FROM billing_document_items bdi JOIN product_descriptions pd ON bdi.material = pd.product AND pd.language = 'EN' GROUP BY bdi.material ORDER BY billingCount DESC LIMIT 10\"}\n\nQ: Trace full flow of a billing document\nA: {\"type\":\"sql\",\"query\":\"SELECT DISTINCT bdh.billingDocument, soh.salesOrder, odh.deliveryDocument, bdh.accountingDocument as journalEntry, jeiar.companyCode, bdh.totalNetAmount FROM billing_document_headers bdh LEFT JOIN journal_entry_items_accounts_receivable jeiar ON jeiar.accountingDocument = bdh.accountingDocument LEFT JOIN billing_document_items bdi ON bdi.billingDocument = bdh.billingDocument LEFT JOIN outbound_delivery_headers odh ON odh.deliveryDocument = bdi.referenceSdDocument LEFT JOIN outbound_delivery_items odi ON odi.deliveryDocument = odh.deliveryDocument LEFT JOIN sales_order_headers soh ON soh.salesOrder = odi.referenceSdDocument ORDER BY bdh.billingDocument DESC LIMIT 10\"}\n\nQ: Find sales orders delivered but not billed\nA: {\"type\":\"sql\",\"query\":\"SELECT DISTINCT soh.salesOrder, odh.deliveryDocument, soh.totalNetAmount FROM sales_order_headers soh JOIN outbound_delivery_items odi ON odi.referenceSdDocument = soh.salesOrder JOIN outbound_delivery_headers odh ON odh.deliveryDocument = odi.deliveryDocument LEFT JOIN billing_document_items bdi ON bdi.referenceSdDocument = odh.deliveryDocument WHERE bdi.billingDocument IS NULL LIMIT 20\"}\n\nQ: Find orders billed without delivery\nA: {\"type\":\"sql\",\"query\":\"SELECT DISTINCT bdh.billingDocument, bdh.soldToParty, bdh.totalNetAmount FROM billing_document_headers bdh LEFT JOIN billing_document_items bdi ON bdi.billingDocument = bdh.billingDocument LEFT JOIN outbound_delivery_headers odh ON odh.deliveryDocument = bdi.referenceSdDocument WHERE odh.deliveryDocument IS NULL LIMIT 20\"}\n\nOnly return the JSON. No explanation. No markdown. No backticks.\n";
+
+    const initialResponse = await client.chat.completions.create({
       model: MODEL,
       messages: [
-        {
-          role: "system",
-          content:
-            'You classify questions. Reply with only "YES" or "NO".',
-        },
+        { role: "system", content: systemPrompt },
         {
           role: "user",
-          content: [
-            "Is this question related to business data about sales orders, deliveries, billing documents, payments, customers, or products?",
-            `Question: ${message}`,
-          ].join("\n"),
+          content: `Question: ${message}\n\nDatabase schema from getSchema():\n${JSON.stringify(schema)}`,
         },
       ],
     });
 
-    const relevanceText = (relevanceResponse.choices[0].message.content || "")
-      .trim()
-      .toUpperCase();
+    const rawContent =
+      initialResponse?.choices?.[0]?.message?.content || "";
+    const parsed = JSON.parse(cleanJsonText(rawContent));
 
-    if (!relevanceText.startsWith("YES")) {
+    if (parsed?.type === "off_topic") {
       return res.json({
         answer:
           "This system only answers questions about the business dataset (sales orders, deliveries, billing, payments, customers and products).",
       });
     }
 
-    const sqlResponse = await client.chat.completions.create({
-      model: MODEL,
-      messages: [
-        {
-          role: "system",
-          content: `You are a SQLite expert. Here is the exact schema and relationships:
+    if (parsed?.type !== "sql" || typeof parsed?.query !== "string") {
+      throw new Error("Invalid model response format");
+    }
 
-TABLES:
-- sales_order_headers: salesOrder, soldToParty, totalNetAmount, overallDeliveryStatus, overallOrdReltdBillgStatus, creationDate, transactionCurrency
-- sales_order_items: salesOrder, salesOrderItem, material, netAmount, requestedQuantity
-- outbound_delivery_headers: deliveryDocument, shippingPoint, overallGoodsMovementStatus, creationDate
-- outbound_delivery_items: deliveryDocument, referenceSdDocument, plant, actualDeliveryQuantity
-- billing_document_headers: billingDocument, soldToParty, totalNetAmount, billingDocumentDate, accountingDocument, billingDocumentIsCancelled
-- billing_document_items: billingDocument, billingDocumentItem, referenceSdDocument, material, netAmount
-- payments_accounts_receivable: accountingDocument, customer, invoiceReference, amountInTransactionCurrency, postingDate, salesDocument
-- business_partners: businessPartner, customer, businessPartnerFullName, businessPartnerName
-- products: product, productType, division
-- product_descriptions: product, language, productDescription
-- journal_entry_items_accounts_receivable: accountingDocument, companyCode, customer, amountInTransactionCurrency, postingDate
-
-CRITICAL RELATIONSHIPS (use these exact joins):
-- Sales Order to Delivery: outbound_delivery_items.referenceSdDocument = sales_order_headers.salesOrder
-- Delivery to Billing: billing_document_items.referenceSdDocument = outbound_delivery_headers.deliveryDocument
-- Billing to Payment: payments_accounts_receivable.invoiceReference = billing_document_headers.billingDocument
-- Billing to Journal: billing_document_headers.accountingDocument = journal_entry_items_accounts_receivable.accountingDocument
-- Customer to Sales Order: sales_order_headers.soldToParty = business_partners.customer
-- Product to Sales Order: sales_order_items.material = products.product
-- Product descriptions: product_descriptions.product = products.product AND product_descriptions.language = 'EN'
-
-EXAMPLE QUERIES:
--- Products with most billing docs:
-SELECT pd.productDescription, COUNT(DISTINCT bdi.billingDocument) as billingCount
-FROM billing_document_items bdi
-JOIN product_descriptions pd ON bdi.material = pd.product AND pd.language = 'EN'
-GROUP BY bdi.material ORDER BY billingCount DESC LIMIT 10
-
--- Full flow trace for a sales order:
-SELECT soh.salesOrder, odh.deliveryDocument, bdh.billingDocument, par.accountingDocument as payment
-FROM sales_order_headers soh
-LEFT JOIN outbound_delivery_items odi ON odi.referenceSdDocument = soh.salesOrder
-LEFT JOIN outbound_delivery_headers odh ON odh.deliveryDocument = odi.deliveryDocument
-LEFT JOIN billing_document_items bdi ON bdi.referenceSdDocument = odh.deliveryDocument
-LEFT JOIN billing_document_headers bdh ON bdh.billingDocument = bdi.billingDocument
-LEFT JOIN payments_accounts_receivable par ON par.invoiceReference = bdh.billingDocument
-LIMIT 10
-
--- Delivered but not billed:
-SELECT DISTINCT soh.salesOrder, odh.deliveryDocument
-FROM sales_order_headers soh
-JOIN outbound_delivery_items odi ON odi.referenceSdDocument = soh.salesOrder
-JOIN outbound_delivery_headers odh ON odh.deliveryDocument = odi.deliveryDocument
-LEFT JOIN billing_document_items bdi ON bdi.referenceSdDocument = odh.deliveryDocument
-WHERE bdi.billingDocument IS NULL
-
-RULES:
-- Only SELECT queries
-- No markdown, no backticks, no explanation, just raw SQL
-- Use GROUP BY + ORDER BY DESC + LIMIT 10 for rankings
-- Use LEFT JOIN to find missing relationships
-
-Write ONE SQLite SELECT query to answer: ${message}`,
-        },
-      ],
-    });
-
-    const sql = cleanSql(sqlResponse.choices[0].message.content || "");
-    if (!/^SELECT\b/i.test(sql)) {
-      throw new Error("Model did not return a valid SELECT query");
+    const originalSql = cleanSql(parsed.query);
+    if (!/^SELECT\b/i.test(originalSql)) {
+      throw new Error("Model returned non-SELECT SQL");
     }
 
     let results;
     try {
-      results = db.prepare(sql).all();
-    } catch (queryError) {
-      if (queryError?.name !== "SqliteError") {
-        throw queryError;
-      }
-
-      const fixResponse = await client.chat.completions.create({
+      results = db.prepare(originalSql).all();
+    } catch (sqlError) {
+      const fixedSqlResponse = await client.chat.completions.create({
         model: MODEL,
         messages: [
           {
             role: "system",
-            content: [
-              `This SQL query failed with error: ${queryError.message}`,
-              `The bad SQL was: ${sql}`,
-              "",
-              "Here is the schema again:",
-              "- billing_document_headers columns: billingDocument, billingDocumentType, creationDate, soldToParty, totalNetAmount, accountingDocument",
-              "- billing_document_items columns: billingDocument, billingDocumentItem, referenceSdDocument, referenceSdDocumentItem, material",
-              "- sales_order_headers columns: salesOrder, soldToParty, totalNetAmount, overallDeliveryStatus, overallOrdReltdBillgStatus",
-              "- outbound_delivery_items columns: deliveryDocument, referenceSdDocument, referenceSdDocumentItem, plant",
-              "- payments_accounts_receivable columns: accountingDocument, invoiceReference, customer, amountInTransactionCurrency",
-              "",
-              "Fix the SQL. Return ONLY the corrected raw SQL query, no explanation, no backticks.",
-            ].join("\n"),
+            content:
+              "Return ONLY the corrected raw SQL query. No explanation. No markdown. No backticks.",
+          },
+          {
+            role: "user",
+            content: `This SQL failed: ${sqlError}. Original SQL: ${originalSql}. Fix it and return only the corrected SQL query, no explanation.`,
           },
         ],
       });
 
-      const fixedSql = cleanSql(fixResponse.choices[0].message.content || "");
+      const fixedSql = cleanSql(
+        fixedSqlResponse?.choices?.[0]?.message?.content || ""
+      );
+      if (!/^SELECT\b/i.test(fixedSql)) {
+        throw new Error("Fixed SQL is not a SELECT query");
+      }
+
       results = db.prepare(fixedSql).all();
     }
 
-    const answerResponse = await client.chat.completions.create({
+    if (!Array.isArray(results) || results.length === 0) {
+      const broadenResponse = await client.chat.completions.create({
+        model: MODEL,
+        messages: [
+          {
+            role: "system",
+            content:
+              "Return ONLY a corrected SQLite SELECT query. No explanation. No markdown. No backticks.",
+          },
+          {
+            role: "user",
+            content: `This SQL returned 0 rows. Question: ${message}\nOriginal SQL: ${originalSql}\nRewrite the SQL to return relevant rows for the question (use LIMIT 10-50). Return only the SQL.`,
+          },
+        ],
+      });
+
+      const broadenSql = cleanSql(
+        broadenResponse?.choices?.[0]?.message?.content || ""
+      );
+      if (!/^SELECT\b/i.test(broadenSql)) {
+        throw new Error("Broadened SQL is not a SELECT query");
+      }
+
+      results = db.prepare(broadenSql).all();
+      if (!Array.isArray(results) || results.length === 0) {
+        return res.json({
+          answer:
+            "I couldn’t find any rows for that query. If you’re tracing a billing document flow, please provide a specific billingDocument ID (e.g., “Trace flow for billing document 9000001234”).",
+        });
+      }
+    }
+
+    const finalResponse = await client.chat.completions.create({
       model: MODEL,
       messages: [
         {
           role: "system",
-          content: "You answer questions clearly and concisely from result data.",
+          content:
+            "You are a helpful business analyst. Answer questions based on data provided. Be specific with numbers.",
         },
         {
           role: "user",
-          content: [
-            `Given these query results in JSON: ${JSON.stringify(results)}`,
-            `Answer this question in plain English: ${message}`,
-            "Be concise. Use actual numbers from the data.",
-          ].join("\n"),
+          content: `Question: ${message}\nData from database: ${JSON.stringify(
+            results
+          )}\nGive a clear, concise answer using the actual data.`,
         },
       ],
     });
 
-    const answer = (answerResponse.choices[0].message.content || "").trim();
+    const answer = (finalResponse?.choices?.[0]?.message?.content || "").trim();
     return res.json({ answer });
   } catch (error) {
     console.error("Chat route error:", error);

@@ -23,8 +23,9 @@ function ChatPanel() {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, isLoading]);
 
-  const sendMessage = async (messageText = input) => {
-    const trimmed = messageText.trim();
+  const sendMessage = async (messageText) => {
+    const text = typeof messageText === "string" ? messageText : input;
+    const trimmed = text.trim();
     if (!trimmed || isLoading) return;
 
     const userMessage = { role: "user", content: trimmed };
@@ -211,7 +212,7 @@ function ChatPanel() {
         />
         <button
           type="button"
-          onClick={sendMessage}
+          onClick={() => sendMessage()}
           disabled={isLoading || !input.trim()}
           style={{
             backgroundColor: "#2563eb",
