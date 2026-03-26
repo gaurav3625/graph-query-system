@@ -26,7 +26,9 @@ function GraphView() {
     async function loadGraph() {
       try {
         setLoading(true);
-        const response = await fetch("http://localhost:5000/api/graph");
+        const response = await fetch(
+          "https://graph-query-system-msbu.onrender.com/api/graph"
+        );
         const data = await response.json();
 
         if (!isMounted) return;
